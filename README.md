@@ -15,7 +15,7 @@ A command-line interface (CLI) tool for automating interactions with the Tea Sep
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/airdropinsiders/Tea-Auto-Bot.git
+git clone https://github.com/Ansh7473/Tea-Auto-Bot.git
 cd Tea-Auto-Bot
 ```
 
