@@ -46,7 +46,7 @@ npm start
 
 ### Main Menu Options:
 
-1. **Send TEA to random addresses** - Transfer TEA to randomly generated addresses
+1. **Send TEA to random addresses** - Transfer TEA to randomly generated addresses (multiple address)
 2. **Stake TEA** - Stake your TEA tokens to earn rewards
 3. **Claim rewards** - Claim your staking rewards
 4. **Withdraw stTEA** - Withdraw your staked TEA tokens
