@@ -96,7 +96,7 @@ function parseProxy(proxy) {
   if (!proxy) return null;
   let proxyUrl = proxy;
   if (!proxy.startsWith('http://') && !proxy.startsWith('https://')) {
-    proxyUrl = `http://${proxy}`;
+    proxyUrl = `https://${proxy}`;
   }
   return proxyUrl;
 }
@@ -155,11 +155,11 @@ ${chalk.white('===============================================')}
 async function createProviders(proxies) {
   const providers = [];
   if (proxies.length === 0) {
-    providers.push(new ethers.providers.JsonRpcProvider(network.rpc));
+    providers.push({ provider: new ethers.providers.JsonRpcProvider(network.rpc), proxy: 'None' });
   } else {
     for (const proxy of proxies) {
       const proxyUrl = parseProxy(proxy);
-      const agent = new HttpsProxyAgent(proxyUrl);
+      const agent = new HttpsProxyAgent(proxyUrl, { keepAlive: true });
       const provider = new ethers.providers.JsonRpcProvider({
         url: network.rpc,
         headers: {
@@ -178,15 +178,11 @@ async function connectToNetwork() {
     const proxies = await loadProxies();
     const providers = await createProviders(proxies);
     const privateKeys = await loadWallets();
-    const wallets = privateKeys.map(key => {
-      const providerData = providers[0];
-      return {
-        wallet: new ethers.Wallet(key, providerData.provider),
-        provider: providerData.provider,
-        proxy: providerData.proxy || 'None'
-      };
-    });
-    
+    const wallets = privateKeys.map(key => ({
+      wallet: new ethers.Wallet(key),
+      defaultProvider: providers[0].provider,
+      proxy: providers[0].proxy
+    }));
     return { providers, wallets };
   } catch (error) {
     console.error(chalk.red('Connection error:', error.message, '❌'));
@@ -195,21 +191,18 @@ async function connectToNetwork() {
 }
 
 async function getWalletInfo(walletData, index) {
-  const { wallet, provider, proxy } = walletData;
+  const { wallet, defaultProvider, proxy } = walletData;
   const address = wallet.address;
+  const provider = defaultProvider;
   const teaBalance = await provider.getBalance(address).catch(() => ethers.BigNumber.from(0));
-  const stTeaContract = new ethers.Contract(
-    stTeaContractAddress,
-    ['function balanceOf(address owner) view returns (uint256)'],
-    wallet
-  );
+  const stTeaContract = new ethers.Contract(stTeaContractAddress, ['function balanceOf(address owner) view returns (uint256)'], wallet.connect(provider));
   const stTeaBalance = await stTeaContract.balanceOf(address).catch(() => ethers.BigNumber.from(0));
   
   console.log(chalk.white(`\n===== WALLET ${index + 1} INFORMATION =====`));
   console.log(chalk.white(`Address: ${chalk.cyan(address)} 👤`));
   console.log(chalk.white(`TEA Balance: ${chalk.cyan(ethers.utils.formatEther(teaBalance))} ${network.symbol} `));
   console.log(chalk.white(`stTEA Balance: ${chalk.cyan(ethers.utils.formatEther(stTeaBalance))} stTEA `));
-  console.log(chalk.white(`Using proxy: ${chalk.cyan(proxy)} 🌐`));
+  console.log(chalk.white(`Default proxy: ${chalk.cyan(proxy)} 🌐`));
   console.log(chalk.white('=============================\n'));
 }
 
@@ -223,6 +216,8 @@ async function withTimeout(promise, timeoutMs, errorMessage) {
   try {
     const result = await Promise.race([promise, timeoutPromise]);
     return result;
+  } catch (error) {
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -230,12 +225,14 @@ async function withTimeout(promise, timeoutMs, errorMessage) {
 
 async function stakeTea(walletData, amount, providers) {
   const maxRetries = 3;
+  let lastGasPrice = null;
   for (let retry = 0; retry <= maxRetries; retry++) {
     try {
       const { provider, proxy } = shuffleArray([...providers])[0];
       const wallet = walletData.wallet.connect(provider);
       const amountWei = ethers.utils.parseEther(amount.toString());
-      const gasPrice = await provider.getGasPrice();
+      const baseGasPrice = await provider.getGasPrice();
+      const gasPrice = lastGasPrice ? lastGasPrice.mul(120).div(100) : baseGasPrice.mul(110).div(100);
       const estimatedGas = 200000;
       const gasCost = ethers.utils.formatEther(gasPrice.mul(estimatedGas));
       
@@ -243,7 +240,7 @@ async function stakeTea(walletData, amount, providers) {
         Action: 'Stake',
         Amount: `${amount} TEA`,
         'Est. Gas': `${gasCost} TEA`,
-        Proxy: proxy || 'None'
+        Proxy: proxy
       });
       
       if (!confirmed) {
@@ -252,10 +249,8 @@ async function stakeTea(walletData, amount, providers) {
         return null;
       }
       
-      const stTeaContract = new ethers.Contract(stTeaContractAddress, stTeaABI, wallet);
-      
       console.log(chalk.white('\n===== STAKING TEA ====='));
-      console.log(chalk.yellow(`Staking ${amount} TEA for ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)} using proxy ${proxy || 'None'}...`));
+      console.log(chalk.yellow(`Staking ${amount} TEA for ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)} using proxy ${proxy} with gas price ${ethers.utils.formatUnits(gasPrice, 'gwei')} Gwei...`));
       
       const nonce = await provider.getTransactionCount(wallet.address, 'pending');
       const tx = await stTeaContract.stake({
@@ -283,9 +278,10 @@ async function stakeTea(walletData, amount, providers) {
       return receipt;
     } catch (error) {
       console.error(chalk.red(`Error staking TEA (attempt ${retry + 1}/${maxRetries + 1}): ${error.message} ❌`));
-      if (retry < maxRetries && (error.code === 'NONCE_EXPIRED' || error.code === 'REPLACEMENT_UNDERPRICED' || error.message.includes('timed out'))) {
-        console.log(chalk.yellow('Retrying with a different proxy...'));
-        await new Promise(resolve => setTimeout(resolve, 1000));
+      if (retry < maxRetries && (error.code === 'NONCE_EXPIRED' || error.code === 'REPLACEMENT_UNDERPRICED' || error.message.includes('timed out') || error.message.includes('rate limit'))) {
+        console.log(chalk.yellow('Retrying with a different proxy and higher gas price...'));
+        lastGasPrice = lastGasPrice || (await providers[0].provider.getGasPrice());
+        await new Promise(resolve => setTimeout(resolve, 2000));
         continue;
       }
       console.log(chalk.white('===== STAKING FAILED =====\n'));
@@ -297,12 +293,14 @@ async function stakeTea(walletData, amount, providers) {
 
 async function withdrawTea(walletData, amount, providers) {
   const maxRetries = 3;
+  let lastGasPrice = null;
   for (let retry = 0; retry <= maxRetries; retry++) {
     try {
       const { provider, proxy } = shuffleArray([...providers])[0];
       const wallet = walletData.wallet.connect(provider);
       const amountWei = ethers.utils.parseEther(amount.toString());
-      const gasPrice = await provider.getGasPrice();
+      const baseGasPrice = await provider.getGasPrice();
+      const gasPrice = lastGasPrice ? lastGasPrice.mul(120).div(100) : baseGasPrice.mul(110).div(100);
       const estimatedGas = 100000;
       const gasCost = ethers.utils.formatEther(gasPrice.mul(estimatedGas));
       
@@ -310,7 +308,7 @@ async function withdrawTea(walletData, amount, providers) {
         Action: 'Withdraw',
         Amount: `${amount} stTEA`,
         'Est. Gas': `${gasCost} TEA`,
-        Proxy: proxy || 'None'
+        Proxy: proxy
       });
       
       if (!confirmed) {
@@ -322,7 +320,7 @@ async function withdrawTea(walletData, amount, providers) {
       const stTeaContract = new ethers.Contract(stTeaContractAddress, stTeaABI, wallet);
       
       console.log(chalk.white('\n===== WITHDRAWING TEA ====='));
-      console.log(chalk.yellow(`Withdrawing ${amount} stTEA for ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)} using proxy ${proxy || 'None'}...`));
+      console.log(chalk.yellow(`Withdrawing ${amount} stTEA for ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)} using proxy ${proxy} with gas price ${ethers.utils.formatUnits(gasPrice, 'gwei')} Gwei...`));
       
       const nonce = await provider.getTransactionCount(wallet.address, 'pending');
       const tx = await stTeaContract.withdraw(amountWei, {
@@ -349,9 +347,10 @@ async function withdrawTea(walletData, amount, providers) {
       return receipt;
     } catch (error) {
       console.error(chalk.red(`Error withdrawing TEA (attempt ${retry + 1}/${maxRetries + 1}): ${error.message} ❌`));
-      if (retry < maxRetries && (error.code === 'NONCE_EXPIRED' || error.code === 'REPLACEMENT_UNDERPRICED' || error.message.includes('timed out'))) {
-        console.log(chalk.yellow('Retrying with a different proxy...'));
-        await new Promise(resolve => setTimeout(resolve, 1000));
+      if (retry < maxRetries && (error.code === 'NONCE_EXPIRED' || error.code === 'REPLACEMENT_UNDERPRICED' || error.message.includes('timed out') || error.message.includes('rate limit'))) {
+        console.log(chalk.yellow('Retrying with a different proxy and higher gas price...'));
+        lastGasPrice = lastGasPrice || (await providers[0].provider.getGasPrice());
+        await new Promise(resolve => setTimeout(resolve, 2000));
         continue;
       }
       console.log(chalk.white('===== WITHDRAW FAILED =====\n'));
@@ -363,22 +362,24 @@ async function withdrawTea(walletData, amount, providers) {
 
 async function claimRewards(walletData, providers) {
   const maxRetries = 3;
+  let lastGasPrice = null;
   for (let retry = 0; retry <= maxRetries; retry++) {
     try {
       const { provider, proxy } = shuffleArray([...providers])[0];
       const wallet = walletData.wallet.connect(provider);
       console.log(chalk.white('\n===== CLAIMING REWARDS ====='));
-      console.log(chalk.yellow(`Claiming stTEA rewards for ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)} using proxy ${proxy || 'None'}...`));
+      console.log(chalk.yellow(`Claiming stTEA rewards for ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)} using proxy ${proxy} with gas price ${ethers.utils.formatUnits(gasPrice, 'gwei')} Gwei...`));
       
       const data = "0x3d18b912";
-      const gasPrice = await provider.getGasPrice();
+      const baseGasPrice = await provider.getGasPrice();
+      const gasPrice = lastGasPrice ? lastGasPrice.mul(120).div(100) : baseGasPrice.mul(110).div(100);
       const estimatedGas = 100000;
       const gasCost = ethers.utils.formatEther(gasPrice.mul(estimatedGas));
       
       const confirmed = await confirmTransaction({
         Action: 'Claim Rewards',
         'Est. Gas': `${gasCost} TEA`,
-        Proxy: proxy || 'None'
+        Proxy: proxy
       });
       
       if (!confirmed) {
@@ -417,9 +418,10 @@ async function claimRewards(walletData, providers) {
       return receipt;
     } catch (error) {
       console.error(chalk.red(`Error claiming rewards (attempt ${retry + 1}/${maxRetries + 1}): ${error.message} ❌`));
-      if (retry < maxRetries && (error.code === 'NONCE_EXPIRED' || error.code === 'REPLACEMENT_UNDERPRICED' || error.message.includes('timed out'))) {
-        console.log(chalk.yellow('Retrying with a different proxy...'));
-        await new Promise(resolve => setTimeout(resolve, 1000));
+      if (retry < maxRetries && (error.code === 'NONCE_EXPIRED' || error.code === 'REPLACEMENT_UNDERPRICED' || error.message.includes('timed out') || error.message.includes('rate limit'))) {
+        console.log(chalk.yellow('Retrying with a different proxy and higher gas price...'));
+        lastGasPrice = lastGasPrice || (await providers[0].provider.getGasPrice());
+        await new Promise(resolve => setTimeout(resolve, 2000));
         continue;
       }
       console.log(chalk.white('===== CLAIMING FAILED =====\n'));
@@ -434,16 +436,30 @@ function generateRandomAddress() {
   return wallet.address;
 }
 
-async function sendToRandomAddress(walletData, amount, providers, skipConfirmation = false, retryCount = 0) {
+async function sendToRandomAddress(walletData, amount, providers, skipConfirmation = false, retryCount = 0, lastTxHash = null, lastGasPrice = null) {
   const maxRetries = 3;
   try {
     const { provider, proxy } = shuffleArray([...providers])[0];
     const wallet = walletData.wallet.connect(provider);
     const toAddress = generateRandomAddress();
     const amountWei = ethers.utils.parseEther(amount.toString());
-    const gasPrice = await provider.getGasPrice();
+    const baseGasPrice = await provider.getGasPrice();
+    const gasPrice = lastGasPrice ? lastGasPrice.mul(120).div(100) : baseGasPrice.mul(110).div(100);
     const estimatedGas = 21000;
     const gasCost = ethers.utils.formatEther(gasPrice.mul(estimatedGas));
+    
+    if (lastTxHash && retryCount > 0) {
+      try {
+        const txStatus = await provider.getTransaction(lastTxHash);
+        if (txStatus && !txStatus.blockNumber) {
+          console.log(chalk.yellow(`Previous transaction ${lastTxHash} still pending. Increasing gas price...`));
+        } else {
+          console.log(chalk.green(`Previous transaction ${lastTxHash} no longer pending. Proceeding...`));
+        }
+      } catch (error) {
+        console.error(chalk.red(`Error checking transaction ${lastTxHash}: ${error.message}`));
+      }
+    }
     
     if (!skipConfirmation) {
       const confirmed = await confirmTransaction({
@@ -451,7 +467,7 @@ async function sendToRandomAddress(walletData, amount, providers, skipConfirmati
         Amount: `${amount} TEA`,
         To: toAddress.slice(0, 6) + '...' + toAddress.slice(-4),
         'Est. Gas': `${gasCost} TEA`,
-        Proxy: proxy || 'None'
+        Proxy: proxy
       });
       
       if (!confirmed) {
@@ -460,7 +476,7 @@ async function sendToRandomAddress(walletData, amount, providers, skipConfirmati
       }
     }
     
-    console.log(chalk.yellow(`Sending ${amount} TEA to random address: ${chalk.cyan(toAddress)} from ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)} using proxy ${proxy || 'None'} 📤`));
+    console.log(chalk.yellow(`Sending ${amount} TEA to random address: ${chalk.cyan(toAddress)} from ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)} using proxy ${proxy} with gas price ${ethers.utils.formatUnits(gasPrice, 'gwei')} Gwei 📤`));
     
     const nonce = await provider.getTransactionCount(wallet.address, 'pending');
     const tx = await wallet.sendTransaction({
@@ -487,12 +503,16 @@ async function sendToRandomAddress(walletData, amount, providers, skipConfirmati
     return { receipt, toAddress };
   } catch (error) {
     console.error(chalk.red(`Error sending TEA (attempt ${retryCount + 1}/${maxRetries + 1}): ${error.message} ❌`));
-    if (retryCount < maxRetries && (error.code === 'NONCE_EXPIRED' || error.code === 'REPLACEMENT_UNDERPRICED' || error.message.includes('timed out'))) {
-      console.log(chalk.yellow('Retrying with a different proxy...'));
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      return sendToRandomAddress(walletData, amount, providers, skipConfirmation, retryCount + 1);
+    if (retryCount < maxRetries && (error.code === 'NONCE_EXPIRED' || error.code === 'REPLACEMENT_UNDERPRICED' || error.message.includes('timed out') || error.message.includes('rate limit'))) {
+      console.log(chalk.yellow('Retrying with a different proxy and higher gas price...'));
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return sendToRandomAddress(walletData, amount, providers, skipConfirmation, retryCount + 1, tx ? tx.hash : lastTxHash, gasPrice || baseGasPrice);
     }
+    console.log(chalk.yellow(`Skipping transfer due to failure.`));
     return null;
+  } finally {
+    // Rate-limit to avoid overwhelming RPC/proxies
+    await new Promise(resolve => setTimeout(resolve, 1000));
   }
 }
 
@@ -510,8 +530,8 @@ async function executeRandomTransfers(wallets, amount, numberOfTransfers, provid
       Action: 'Batch Transfer',
       'Total Amount': `${(amount * numberOfTransfers * walletCount).toFixed(4)} TEA`,
       Transfers: numberOfTransfers * walletCount,
-      'Est. Gas': `${gasCost} TEA`,
-      'Max Threads': config.maxConcurrentThreads
+      Wallets: walletCount,
+      'Est. Gas': `${gasCost} TEA`
     });
     
     if (!confirmed) {
@@ -524,38 +544,28 @@ async function executeRandomTransfers(wallets, amount, numberOfTransfers, provid
   console.log(chalk.yellow(`Starting ${numberOfTransfers} transfers per wallet...\n`));
   
   const results = [];
-  
-  // If wallets is an array (all wallets selected), process for each wallet
-  if (Array.isArray(wallets)) {
-    for (const walletData of wallets) {
-      console.log(chalk.cyan(`\nProcessing transfers for wallet ${walletData.wallet.address.slice(0, 6)}...${walletData.wallet.address.slice(-4)}`));
-      const queue = Array.from({ length: numberOfTransfers }, (_, i) => i);
-      
-      // Process transfers sequentially to avoid nonce issues
-      for (const index of queue) {
-        console.log(chalk.white(`\nTransfer ${index + 1}/${numberOfTransfers}`));
-        const result = await sendToRandomAddress(walletData, amount, providers, true);
-        if (result) {
-          results.push(result);
-        } else {
-          console.log(chalk.yellow(`Skipping transfer ${index + 1} due to failure.`));
-        }
-      }
-    }
-  } else {
-    // Single wallet case
+  const processWallet = async (walletData) => {
+    console.log(chalk.cyan(`\nProcessing transfers for wallet ${walletData.wallet.address.slice(0, 6)}...${walletData.wallet.address.slice(-4)}`));
     const queue = Array.from({ length: numberOfTransfers }, (_, i) => i);
     
-    // Process transfers sequentially
     for (const index of queue) {
       console.log(chalk.white(`\nTransfer ${index + 1}/${numberOfTransfers}`));
-      const result = await sendToRandomAddress(wallets, amount, providers, true);
+      const result = await sendToRandomAddress(walletData, amount, providers, true);
       if (result) {
         results.push(result);
       } else {
         console.log(chalk.yellow(`Skipping transfer ${index + 1} due to failure.`));
       }
     }
+  };
+  
+  if (Array.isArray(wallets)) {
+    // Process wallets sequentially to reduce RPC load
+    for (const walletData of wallets) {
+      await processWallet(walletData);
+    }
+  } else {
+    await processWallet(wallets);
   }
   
   console.log(chalk.green(`\nCompleted ${results.length}/${numberOfTransfers * (Array.isArray(wallets) ? wallets.length : 1)} transfers successfully. 🎉`));
